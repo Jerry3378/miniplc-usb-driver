@@ -3,9 +3,10 @@
  * USB Skeleton driver - 2.2
  *
  * Copyright (C) 2001-2004 Greg Kroah-Hartman (greg@kroah.com)
+ * Copyright (C) 2026 JaemoPark (packjemo@gmail.com)
  *
  * This driver is based on the 2.6.3 version of drivers/usb/usb-skeleton.c
- * but has been rewritten to be easier to read and use.
+ * and has been modified for the miniPLC project.
  */
 
 #include <linux/kernel.h>	//커널 개발시 쓰이는 기본 함수(printk, KERNER_INFO, min,max 매크로 사용)
@@ -829,5 +830,5 @@ module_init(usb_init);
 module_exit(usb_exit);
 
 MODULE_LICENSE("GPL v2");
-MODULE_AUTHOR("Const");
-MODULE_DESCRIPTION("My USB Device Driver Project");
+MODULE_AUTHOR("JaemoPark");
+MODULE_DESCRIPTION("A custom Linux USB device driver to interface with miniPLC hardware via bulk transfer.");
