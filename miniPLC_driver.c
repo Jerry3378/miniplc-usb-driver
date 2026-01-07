@@ -19,6 +19,8 @@
 #include <linux/mutex.h>	//뮤텍스 락 제공 (struct mutex, mutex_lock, mutex_unlock). 드라이버 내부에서 여러 프로세스가 동시에 장치를 접근하지 않도록 보호.
 #include <linux/printk.h>   // hexdump 형식 헤더
 
+/* driver 내부 버퍼 관련 변수*/
+#define BUFFER_SIZE 1024 //  rx_buffer용 사이즈 (2의 10 제곱)
 
 /* 드라이버와 매칭시킬 디바이스 벤더 ID와 ProductID를 설정한다. */
 #define USB_PROJECT_VENDOR_ID	0x03eb
@@ -26,7 +28,7 @@
 #define USB_INTERFACE_CLASS 0xff		//디바이스 인터페이스 번호(부호 없는 8비트 형식).
 
 /* 최대 전송 길이입니다. */
-#define MAX_TRANSFER		(PAGE_SIZE - 512)
+#define MAX_TRANSFER		64  // atmega32u4같은 경우는 full speed여서 urb당 64바이트임
 #define WRITES_IN_FLIGHT	5   // 한번에 write할때 보낼 urb 갯수
 
 /* 해당 드라이버와 매칭할 USB테이블을 할당한다.  우리가 사용할 atmega32u4같은 경우 
@@ -39,6 +41,15 @@
 	{ USB_DEVICE_INTERFACE_CLASS(USB_PROJECT_VENDOR_ID, USB_PROJECT_PRODUCT_ID,0xff) },
 	{ }					/* Terminating entry */
 };
+
+struct protocol_header {
+    __u8 stx;
+    __u8 len;
+    __u8 unit;
+    __u8 cmd;
+    __u16 address;
+    __u8 payload;
+} __attribute__((packed));
 
 //probe단계 중 usb_find_interface함수에서 my_usb_driver가 호출됨으로 여기서 미리 protocol을 선언한다.
 //함수 정의를 옮기기에는 my_sub_driver 구조체도 probe, disconnect를 멤버로 가지기엔 protocol선언이 바람직해 보인다.
@@ -64,6 +75,7 @@ struct usb_info {
 
     //bulk out
     __u8 bulk_out_endpointAddr; //bulk out 엔드포인트 주소(bulk out은 write를 통해 장치에 보내주기만 하면 됨)
+    unsigned char *bulk_out_buffer;     // bulk out 버퍼입니다.
 
     /*커널 관련 변수*/
     struct mutex io_mutex; //뮤텍스 구조체(임계영역 보호용)
@@ -74,7 +86,14 @@ struct usb_info {
     unsigned long disconnected:1;        //disconnected된 상태를 알려줄 상태 flag변수 (변수이름뒤에:1은 해당 변수중 1비트만 쓰겠다는 의미)
     int errors;                          // error에 대한 상태
 
+    // 커널 내부 링버퍼 관련 버퍼
+    unsigned int head;       // 생성자
+    unsigned int tail;       // 소비자    
+    __u8 rx_buffer[BUFFER_SIZE];       // USB 엔드포인트로부터 수신된 데이터를 저장하는 수신(RX) 버퍼
+    struct mutex buf_mutex;                 // 링 버퍼용 뮤택스
 
+    // 프로토콜 관련 변수
+    struct protocol_header header;
 };
 
 //해당 매크로 함수는 매개변수 d를 멤버로 가지는 구조체의 주소를 찾기 위한 매크로 함수입니다. 
@@ -149,14 +168,6 @@ static int usb_open(struct inode *inode, struct file *file)
 
     dev_info(&interface->dev, "[USB OPEN][my_usb_open] : success to get interface data!\n");
 
-    //자동 전원 관리(Auto Power Management) 기능과 관련(LDD3 참고해야할듯) << 이부분에서 오류가 생겨서 open이 안된거였음
-    //retval = usb_autopm_get_interface(interface);
-	//if (retval) {
-    //    dev_err(&interface->dev, "somthing is wrong : %d\n", retval); 
-	//	goto exit;
-    //}
-    //dev_info(&interface->dev, "usb_autopm_get_interface retval: %d\n", retval);
-
     //참조 카운트 1증가
     kref_get(&dev->kref);
 
@@ -195,6 +206,43 @@ static int usb_release(struct inode *inode, struct file *file) {
     return 0;
 }
 
+static int dequeue(struct urb *urb) 
+{
+    struct usb_info *dev = urb->context;
+
+    mutex_lock(&dev->buf_mutex);
+
+    // TODO : REad 구현
+    // if ((dev->tail) % BUFFER_SIZE)
+
+    return 0;
+}
+
+// ring buffer에 read callback 함수로부터 받은 데이터를 복사할 함수
+static int enqueue(struct urb *urb)
+{
+    struct usb_info *dev = urb->context;
+
+    mutex_lock(&dev->buf_mutex);
+
+    // 링버퍼 full 체크
+    if ((dev->head + 1) % BUFFER_SIZE == dev->tail) {
+        pr_err("ring buffer full!\n");
+        return -ENOMEM;
+    }
+
+    // 데이터 복사
+    memcpy(dev->rx_buffer[dev->head], dev->bulk_in_buffer, urb->actual_length);
+
+    // head 이동 buffer size로 나머지 연산을 해야함
+    dev->head = (dev->head + 1) % BUFFER_SIZE;
+
+    mutex_unlock(&dev->buf_mutex);
+
+    return 0;
+}
+
+
 // 디바이스로부터 요청한 read_bulk_urb가 성공적으로 올때 호출됩니다.
 static void usb_read_callback(struct urb *urb) {
     struct usb_info *dev;
@@ -232,6 +280,8 @@ static void usb_read_callback(struct urb *urb) {
                urb->transfer_buffer,
                urb->actual_length,
                true);
+    
+    
 
     // bulk-in 전송이 완료되었으므로, 블로킹(Blocking)된 읽기 작업을 실행 상태로 전환합니다.
     wake_up_interruptible(&dev->bulk_in_wait);
@@ -421,6 +471,36 @@ retry:
 
 }
 
+// 패킷을 보내기 전 프로토콜을 확인하는 함수
+static int check_protocol(__u8* kbuf, struct protocol_header *header, size_t actual_size) 
+{
+
+    // check if protocol start from 0x02(STX)
+    /* Do NOT dereference userspace pointers in kernel context.
+     * Always copy to kernel buffer first.
+     */
+    if ((kbuf[0] != 0x02)) {
+        return -EINVAL;
+    }
+
+    printk("success check STX, kbuf[0] is %02x\n",kbuf[0]);
+
+    // header length check
+    memcpy(header,kbuf,sizeof(struct protocol_header));
+
+    printk("success to check header length\n");
+
+    // check LEN if different from actual_size
+    // len멤버는 STX서부터 CRC전까지의 
+    if (header->len != actual_size) {
+        return -EMSGSIZE;
+    }
+
+    printk("success to check total length, length is : %02x\n", header->len);
+
+    return 0;
+}
+
 static void usb_write_bulk_callback(struct urb *urb) {
     struct usb_info *dev;
     unsigned long flags;
@@ -446,6 +526,13 @@ static void usb_write_bulk_callback(struct urb *urb) {
         printk("[USB WRITE CALLBACK][usb write callback] : success to check urb_status");
     }
 
+        print_hex_dump(KERN_INFO, "tx: ",
+               DUMP_PREFIX_OFFSET,
+               16, 1,
+               urb->transfer_buffer,
+               urb->actual_length,
+               true);
+
     // 버퍼 할당 후 해제
 	usb_free_coherent(urb->dev, urb->transfer_buffer_length,
 			  urb->transfer_buffer, urb->transfer_dma);
@@ -462,7 +549,6 @@ static ssize_t usb_write(struct file *file, const char *user_buffer, size_t coun
     struct urb *urb = 0;
     char *buf = NULL;
     size_t writesize = min_t(size_t, count, MAX_TRANSFER);
-    __u8 *kbuf = 0;     // kbuf is copied from buf which copied from user_buffer
 
     dev = file->private_data;
 
@@ -526,9 +612,10 @@ static ssize_t usb_write(struct file *file, const char *user_buffer, size_t coun
     */
    printk("[USB WRITE][usb_write] : success to alloc_coherent!\n");
 
-    /* * [데이터 복사] 유저 공간에 있는 데이터를 커널 공간(우리가 만든 버퍼)으로 안전하게 가져옵니다.
-    * 일반적인 memcpy를 쓰지 않고 이 함수를 쓰는 이유는 '보안'과 '안정성' 때문입니다.
-    */
+    /* copy_from_user()는
+    CPU가 buf가 가리키는 커널 가상주소에,
+    user buffer가 가리키는 userspace 가상주소의 내용을 복사한 것입니다. */
+    
     if (copy_from_user(buf, user_buffer, writesize)) {
         /* * 만약 복사에 실패했다면 (반환값이 0이 아니라면):
         * 유저가 준 주소가 엉터리거나, 접근 권한이 없는 메모리일 경우입니다.
@@ -537,16 +624,10 @@ static ssize_t usb_write(struct file *file, const char *user_buffer, size_t coun
         goto error;        /* 할당받은 메모리를 해제하는 에러 처리 구간으로 이동 */
     }
 
-    // check if protocol start from 0x02(STX)
-    /* Do NOT dereference userspace pointers in kernel context.
-     * Always copy to kernel buffer first.
-     */
-    kbuf = buf;
 
-   if (kbuf[0] != 0x02) {
-        pr_err("protocol error: invalid STX (0x%02x)\n", buf[0]);
+    // check if protocol is ok
+    if (check_protocol((__u8*)buf, &dev->header, writesize) < 0)
         goto error;
-   }
 
     // 데이터 전송
 	mutex_lock(&dev->io_mutex);
@@ -568,19 +649,14 @@ static ssize_t usb_write(struct file *file, const char *user_buffer, size_t coun
 	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
     printk( "[USB WRITE][usb_write] : success to fill urb\n");
-
-    print_hex_dump(KERN_INFO, "tx: ",
-               DUMP_PREFIX_OFFSET,
-               16, 1,
-               urb->transfer_buffer,
-               urb->actual_length,
-               true);
+    printk(" buf : %s\n",buf);
 
     // anchor urb는 여러 개의 URB를 하나의 리스트로 묶어서 관리할 수 있게 해준다. 
 	usb_anchor_urb(urb, &dev->submitted);
 
 	/* bulk port로 urb를 보냄 */
 	retval = usb_submit_urb(urb, GFP_KERNEL);
+
 	mutex_unlock(&dev->io_mutex);
 
     printk( "[USB WRITE][usb_write] : success to submit urb!! \n");
@@ -591,6 +667,12 @@ static ssize_t usb_write(struct file *file, const char *user_buffer, size_t coun
 			__func__, retval);
 		goto error_unanchor;
 	}
+
+    // urb 해제
+	usb_free_urb(urb);
+
+    // 성공시 자원은 건드리지 않고 return 해야함
+    goto exit;
     
 
 error_unanchor:
@@ -660,6 +742,10 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
     mutex_init(&dev->io_mutex);
     dev_info(&interface->dev, "[USB PROBE][usb_probe] : success to initalize mutex!!\n");
 
+    // 링 버퍼용 mutex 초기화
+    mutex_init(&dev->buf_mutex);
+    dev_info(&interface->dev, "[USB PROBE][usb_probe] : success to initalize ring buffer mutex!!\n");    
+
     // bulk wait queue 초기화
     init_waitqueue_head(&dev->bulk_in_wait);
     dev_info(&interface->dev, "[USB PROBE][usb_probe] : success to initalize bulk_in_wait!!\n");
@@ -674,7 +760,12 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
 
     //이 부분을 안할 시 disconnect 과정에서 초기화 하지 않은 쓰레기값을 참조하게 되는 오류가 생김
     init_usb_anchor(&dev->submitted);
-    dev_info(&interface->dev, "[USB PROBE][usb_probe] : success to initalize anchor!!\n");        
+    dev_info(&interface->dev, "[USB PROBE][usb_probe] : success to initalize anchor!!\n");    
+    
+    // 구조체 내부 rx_buffer 관련 head, tail 구조체 초기화
+    dev->head = 0;
+    dev->tail = 0;
+
 
 
     /*usb 디바이스, 인터페이스 구조체 포인터 할당*/
@@ -809,9 +900,9 @@ static void usb_disconnect(struct usb_interface *interface) {
 
 //usb core에 등록할 드라이버 정보 구조체이다.
 static struct usb_driver my_usb_driver = {
-    .name = "usb-project",  //usb core에 등록할 드라이버 구조체 이름이다.
+    .name = "miniPLC-usb-driver",  //usb core에 등록할 드라이버 구조체 이름이다.
     .id_table = usb_device_table,  // 지원하는 VID/PID 매칭
-    .probe = usb_probe,   //probe단계에서 호출할 콜백 함수이다. 
+    .probe = usb_probe,   //probe단계에서 호출할 콜백 함수이다.
     .disconnect = usb_disconnect,  //usb 연결이 끓어졌을 때 호출할 함수이다.
 };
 
