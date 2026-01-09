@@ -18,6 +18,8 @@
 #include <linux/usb.h>		//USB 관련 구조체와 함수 정의. struct usb_device, struct usb_interface, usb_register_driver, usb_bulk_msg 등이 여기 있음. USB 드라이버의 핵심.
 #include <linux/mutex.h>	//뮤텍스 락 제공 (struct mutex, mutex_lock, mutex_unlock). 드라이버 내부에서 여러 프로세스가 동시에 장치를 접근하지 않도록 보호.
 #include <linux/printk.h>   // hexdump 형식 헤더
+#include <linux/crc16.h>    // CRC검증 시 필요함, 산업용은 16비트 CRC검증을 함
+#include <linux/byteorder/generic.h>  // 리눅스 커널에서 바이트 오더(빅/리틀 엔디안)를 책임짐
 
 /* driver 내부 버퍼 관련 변수*/
 #define BUFFER_SIZE 1024 //  rx_buffer용 사이즈 (2의 10 제곱)
@@ -31,6 +33,11 @@
 #define MAX_TRANSFER		64  // atmega32u4같은 경우는 full speed여서 urb당 64바이트임
 #define WRITES_IN_FLIGHT	5   // 한번에 write할때 보낼 urb 갯수
 
+/* 최대, 최소 프로토콜 길이 */
+#define MIN_PROTO_LEN  6       // (ID길이(1) + CMD 길이(1) + ADDR 길이(2))
+#define MAX_PROTO_LEN  251     // 최대 LEN 값은 255 - STX(1) - CRC(2) - 1 (LEN 필드)
+#define PROTO_HEAD_LEN  6
+
 /* 해당 드라이버와 매칭할 USB테이블을 할당한다.  우리가 사용할 atmega32u4같은 경우 
 	이미 드라이버들이 있기 때문에 USB_DEVICES_INTERFACE_CLASS 매크로를 통해 usb_device_id 구조체에 
 	인터페이스 클래스를 추가함으로써 새로운 인터페이스를 사용하는 드라이버로 만들 예정이다. 
@@ -41,15 +48,6 @@
 	{ USB_DEVICE_INTERFACE_CLASS(USB_PROJECT_VENDOR_ID, USB_PROJECT_PRODUCT_ID,0xff) },
 	{ }					/* Terminating entry */
 };
-
-struct protocol_header {
-    __u8 stx;
-    __u8 len;
-    __u8 unit;
-    __u8 cmd;
-    __u16 address;
-    __u8 payload;
-} __attribute__((packed));
 
 //probe단계 중 usb_find_interface함수에서 my_usb_driver가 호출됨으로 여기서 미리 protocol을 선언한다.
 //함수 정의를 옮기기에는 my_sub_driver 구조체도 probe, disconnect를 멤버로 가지기엔 protocol선언이 바람직해 보인다.
@@ -75,7 +73,6 @@ struct usb_info {
 
     //bulk out
     __u8 bulk_out_endpointAddr; //bulk out 엔드포인트 주소(bulk out은 write를 통해 장치에 보내주기만 하면 됨)
-    unsigned char *bulk_out_buffer;     // bulk out 버퍼입니다.
 
     /*커널 관련 변수*/
     struct mutex io_mutex; //뮤텍스 구조체(임계영역 보호용)
@@ -91,9 +88,7 @@ struct usb_info {
     unsigned int tail;       // 소비자    
     __u8 rx_buffer[BUFFER_SIZE];       // USB 엔드포인트로부터 수신된 데이터를 저장하는 수신(RX) 버퍼
     struct mutex buf_mutex;                 // 링 버퍼용 뮤택스
-
-    // 프로토콜 관련 변수
-    struct protocol_header header;
+    unsigned int rx_len;                // enqueu 내에서 사용될 현재 누적된 버퍼
 };
 
 //해당 매크로 함수는 매개변수 d를 멤버로 가지는 구조체의 주소를 찾기 위한 매크로 함수입니다. 
@@ -228,11 +223,45 @@ static int enqueue(struct urb *urb)
     // 링버퍼 full 체크
     if ((dev->head + 1) % BUFFER_SIZE == dev->tail) {
         pr_err("ring buffer full!\n");
+        mutex_unlock(&dev->buf_mutex);
+        return -ENOMEM;
+    }
+    
+    // 전달된 urb 데이터 복사
+    memcpy(dev->rx_buffer[dev->head], urb->transfer_buffer, urb->actual_length);
+    dev->rx_len += urb->actual_length;
+
+    __u8 *tmp_buf = dev->rx_buffer;
+    __u8 len = tmp_buf[1];
+
+    // 1. STX 체크
+    if (temp_buf[0] != 0x02) {
+        return -EINVAL;
+    }
+
+    // 수신 받은 길이가 len 필드 기준 적은지
+    if (dev->rx_len < len) {
         return -ENOMEM;
     }
 
-    // 데이터 복사
-    memcpy(dev->rx_buffer[dev->head], dev->bulk_in_buffer, urb->actual_length);
+    // CRC 체크
+
+    int crc_offset = len + 2;       // STX(1) + LEN(1) + (len 길이) -> CRC
+
+    // crc 수신
+    __u16 recv_crc = (kbuf[crc_offset + 1 ] << 8 ) | kbuf[crc_offset];
+
+    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : received CRC: 0x%04x\n", recv_crc);
+
+    // 계산 CRC
+    // CRC 범위 : payload + address + cmd + id (STX와 CRC 제외)
+    __u16 calc_crc = crc16(0xFFFF, &tmp_buf[2], len);
+
+    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : calculated CRC: 0x%04x\n", calc_crc);
+
+    if (recv_crc != calc_crc) {
+        return -EBADMSG;
+    }
 
     // head 이동 buffer size로 나머지 연산을 해야함
     dev->head = (dev->head + 1) % BUFFER_SIZE;
@@ -273,6 +302,7 @@ static void usb_read_callback(struct urb *urb) {
     dev->ongoing_read = 0;
     spin_unlock_irqrestore(&dev->err_lock, flags);
 
+    int retval = enqueue(urb);
     
     print_hex_dump(KERN_INFO, "rx: ",
                DUMP_PREFIX_OFFSET,
@@ -295,7 +325,7 @@ static int usb_do_read_io(struct usb_info *dev, size_t count) {
     usb_fill_bulk_urb(dev->bulk_in_urb,      //urb
                 dev->udev,                  //device
                 usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr),      //endpoint pipe
-                dev->bulk_in_buffer,            // 전송할 버퍼
+                dev->bulk_in_buffer,            // 전송할 버퍼(받을 버퍼)
                 min(dev->bulk_in_size, count),       // 버퍼 크기
                 usb_read_callback,           // 호출할 call back 함수
                 dev);
@@ -454,7 +484,6 @@ retry:
             // 아직 유저가 요청한 크기의 데이터가 도착이 안됐으면
             if (available < count) 
                 usb_do_read_io(dev, count - chunk);
-                // << 이 부분 goto retry;하는게 낫지 않을까요?
         } else {
                 // 그게 아니라면 count만큼 다시한번 요청
                 usb_do_read_io(dev, count);
@@ -471,33 +500,81 @@ retry:
 
 }
 
-// 패킷을 보내기 전 프로토콜을 확인하는 함수
-static int check_protocol(__u8* kbuf, struct protocol_header *header, size_t actual_size) 
+/*
+ * Validate protocol frame structure for kernel safety.
+ * Performs minimum length, STX, and length sanity checks only.
+ * Does not validate protocol semantics.
+ */
+static int check_protocol(__u8* kbuf, size_t actual_size) 
 {
 
-    // check if protocol start from 0x02(STX)
-    /* Do NOT dereference userspace pointers in kernel context.
-     * Always copy to kernel buffer first.
-     */
+    // 프로토콜이 0x02 즉 STX로부터 시작하는지 확인
     if ((kbuf[0] != 0x02)) {
+        printk(KERN_ERR "[CHECK_PROTOCOL][check_protocol] : protocol error: invalid STX (0x%02x)\n", kbuf[0]);
         return -EINVAL;
     }
 
-    printk("success check STX, kbuf[0] is %02x\n",kbuf[0]);
+     printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : STX check passed: 0x%02x\n", kbuf[0]);
 
-    // header length check
-    memcpy(header,kbuf,sizeof(struct protocol_header));
+    __u8 len = kbuf[1];
 
-    printk("success to check header length\n");
-
-    // check LEN if different from actual_size
-    // len멤버는 STX서부터 CRC전까지의 
-    if (header->len != actual_size) {
+    // 최소 길이 검증 : actual_length(write size)가 header_protocol 보다 작지는 않은지 (작으면 아직 프레임이 완전하지 않음) 
+    if (actual_size < PROTO_HEAD_LEN) {
+        printk(KERN_WARNING "[CHECK_PROTOCOL][check_protocol] : write size small: actual_size=%zu, header_size=%zu\n",
+               actual_size, PROTO_HEAD_LEN);
         return -EMSGSIZE;
     }
 
-    printk("success to check total length, length is : %02x\n", header->len);
+    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : write size OK: actual_size=%zu\n", actual_size);
 
+    // header->len 파트 합리성 검증 : header->len이 min_frame보다 크고, max_frame보다 작은지
+    if (len < MIN_PROTO_LEN || len > MAX_PROTO_LEN) {
+        printk(KERN_WARNING "[CHECK_PROTOCOL][check_protocol] : header length out of range: %u\n", header->len);
+        return -EMSGSIZE;
+    }
+
+    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : header length OK: %u\n", header->len);
+
+    // 전송 단위와의 관계 검증 : header->len과 actual_length(write size)를 비교
+    size_t expected = len + 4;      // header len + STX(1) + LEN(1) + CRC(2)
+    
+    if (expected != actual_size) {
+        printk(KERN_WARNING "[CHECK_PROTOCOL][check_protocol] : total length mismatch: expected=%zu, actual=%zu\n",
+               expected, actual_size);
+        return -EMSGSIZE;
+    }
+
+    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : total length check passed: %zu bytes\n", actual_size);
+
+    // crc 위치 계산
+    int crc_offset = len + 2;       // STX(1) + LEN(1) + (len 길이) -> CRC
+
+    // crc 수신
+
+    // write과정에선 유저 스페이스에서 리틀 엔디안으로 처리할 수 있으니 리틀 형식으로 데이터를 얻습니다
+    __u16 recv_crc = get_unaligned_le16(kbuf+crc_offset);
+
+    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : received CRC: 0x%04x\n", recv_crc);
+
+    // 계산 CRC
+    // CRC 범위 : payload + address + cmd + id (STX와 CRC 제외)
+    __u16 calc_crc = crc16(0xFFFF, &kbuf[2], (header->len));
+
+    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : calculated CRC: 0x%04x\n", calc_crc);
+
+    if (recv_crc != calc_crc) {
+        return -EBADMSG;
+    }
+
+    // 검증이 다 끝났다면 16비트 이상의 값들을 빅 엔디안화 시킵니다.
+    put_unaligned_be16(recv_crc,kbuf+crc_offset);               //빅 엔디안 처리CRC
+    
+    __u16 address = get_unaligned_le16(kbuf+(crc_offset-4));    // 리틀 엔디안으로 읽어옴
+    put_unaligned_be16(address,kbuf+(crc_offset-4));            // 주소값 빅 엔디안 처리
+
+    __u16 payload = get_unaligned_le16(kbuf+(crc_offset-2));    // 리틀 엔디안으로 읽어옴
+    put_unaligned_be16(payload, kbuf+(crc_offset-2));           // payload 빅 엔디안 처리
+    
     return 0;
 }
 
@@ -608,7 +685,6 @@ static ssize_t usb_write(struct file *file, const char *user_buffer, size_t coun
     * -> 여기에 copy_from_user()로 데이터를 채워 넣습니다.
     *
     * 2. urb->transfer_dma (4번째 인자): USB 하드웨어(컨트롤러)가 접근할 때 쓰는 주소.
-    * -> 하드웨어는 똑똑하지 않아서 CPU의 가상 주소를 이해 못 하므로, 이 전용 주소가 꼭 필요합니다.
     */
    printk("[USB WRITE][usb_write] : success to alloc_coherent!\n");
 
@@ -625,8 +701,8 @@ static ssize_t usb_write(struct file *file, const char *user_buffer, size_t coun
     }
 
 
-    // check if protocol is ok
-    if (check_protocol((__u8*)buf, &dev->header, writesize) < 0)
+    // check if protocol structure is fit for deliver
+    if (retval = check_protocol((__u8*)buf, writesize) < 0)
         goto error;
 
     // 데이터 전송
@@ -649,7 +725,6 @@ static ssize_t usb_write(struct file *file, const char *user_buffer, size_t coun
 	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
     printk( "[USB WRITE][usb_write] : success to fill urb\n");
-    printk(" buf : %s\n",buf);
 
     // anchor urb는 여러 개의 URB를 하나의 리스트로 묶어서 관리할 수 있게 해준다. 
 	usb_anchor_urb(urb, &dev->submitted);
@@ -695,8 +770,8 @@ static const struct file_operations usb_fops = {
     .owner = THIS_MODULE,
     .open = usb_open,       // file이 open될때 호출
     .release = usb_release,     // file 이 close 될때 호출
-    .read = usb_read,
-    .write = usb_write,
+    .read = usb_read,       // file을 읽을때 호출
+    .write = usb_write,     // file을 write 할때 호출
 };
 
 struct usb_class_driver my_usb_class = {
@@ -765,6 +840,7 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
     // 구조체 내부 rx_buffer 관련 head, tail 구조체 초기화
     dev->head = 0;
     dev->tail = 0;
+    dev->rx_len = 0;
 
 
 
