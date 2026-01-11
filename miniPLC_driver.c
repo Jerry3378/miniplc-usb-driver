@@ -20,6 +20,8 @@
 #include <linux/printk.h>   // hexdump 형식 헤더
 #include <linux/crc16.h>    // CRC검증 시 필요함, 산업용은 16비트 CRC검증을 함
 #include <linux/byteorder/generic.h>  // 리눅스 커널에서 바이트 오더(빅/리틀 엔디안)를 책임짐
+#include <linux/unaligned.h>          // 리눅스 get_unaligned 관련 함수
+#include <linux/kfifo.h>               // 커널에서 fifo를 사용하기 위한 헤더
 
 /* driver 내부 버퍼 관련 변수*/
 #define BUFFER_SIZE 1024 //  rx_buffer용 사이즈 (2의 10 제곱)
@@ -30,13 +32,31 @@
 #define USB_INTERFACE_CLASS 0xff		//디바이스 인터페이스 번호(부호 없는 8비트 형식).
 
 /* 최대 전송 길이입니다. */
-#define MAX_TRANSFER		64  // atmega32u4같은 경우는 full speed여서 urb당 64바이트임
+#define MAX_TRANSFER_PACKET		64  // atmega32u4같은 경우는 full speed여서 urb당 64바이트임
 #define WRITES_IN_FLIGHT	5   // 한번에 write할때 보낼 urb 갯수
 
 /* 최대, 최소 프로토콜 길이 */
-#define MIN_PROTO_LEN  6       // (ID길이(1) + CMD 길이(1) + ADDR 길이(2))
+#define MIN_PROTO_LEN  6       // (STX(1) + LEN(1) + ID길이(1) + CMD 길이(1) + ADDR 길이(2))
 #define MAX_PROTO_LEN  251     // 최대 LEN 값은 255 - STX(1) - CRC(2) - 1 (LEN 필드)
 #define PROTO_HEAD_LEN  6
+
+// read에서 read에 대한 상태 체크를 위한 enum입니다
+typedef enum {
+    /* 0: 아직 데이터를 받지 않았거나 에러 후 초기화된 상태 */
+    PROTOCOL_STATE_IDLE,         
+    
+    /* 1: STX(시작 바이트)를 기다리는 상태 (Stream에서 동기화 지점 탐색) */
+    PROTOCOL_STATE_WAIT_STX,     
+    
+    /* 2: STX 발견 후, 패킷의 길이(LEN) 정보를 읽는 상태 */
+    PROTOCOL_STATE_READ_LEN,     
+    
+    /* 3: LEN만큼 실제 데이터(ID, CMD, ADDR, DATA 등)를 수집하는 상태 */
+    PROTOCOL_STATE_READ_PAYLOAD, 
+    
+    /* 4: 모든 데이터를 받았고, CRC 검증만 남은 상태 */
+    PROTOCOL_STATE_VERIFY_CRC,   
+} protocol_state_t;
 
 /* 해당 드라이버와 매칭할 USB테이블을 할당한다.  우리가 사용할 atmega32u4같은 경우 
 	이미 드라이버들이 있기 때문에 USB_DEVICES_INTERFACE_CLASS 매크로를 통해 usb_device_id 구조체에 
@@ -85,14 +105,20 @@ struct usb_info {
 
     // 커널 내부 링버퍼 관련 버퍼
     unsigned int head;       // 생성자
-    unsigned int tail;       // 소비자    
-    __u8 rx_buffer[BUFFER_SIZE];       // USB 엔드포인트로부터 수신된 데이터를 저장하는 수신(RX) 버퍼
+    __u8 rx_buffer[BUFFER_SIZE];       // USB 엔드포인트로부터 수신된 데이터를 조립하는 임시 저장소
     struct mutex buf_mutex;                 // 링 버퍼용 뮤택스
     unsigned int rx_len;                // enqueu 내에서 사용될 현재 누적된 버퍼
+    protocol_state_t rx_status;             // rxbuffer의 상태를 나타낼 변수
+    unsigned int packet_len;            // read시 수신받은 패킷 길이
+    unsigned int rx_start;              
+    struct kfifo rx_fifo;               // 데이터를 담을 링 버퍼
 };
 
 //해당 매크로 함수는 매개변수 d를 멤버로 가지는 구조체의 주소를 찾기 위한 매크로 함수입니다. 
 #define to_usb_dev(d) container_of(d, struct usb_info, kref)
+
+// 이러한 선언이 없어서 함수 정의보다 위에 함수를 쓸시 다음과 같은 오류가 생김
+static int usb_do_read_io(struct usb_info *dev, size_t count);
 
 /* usb정보를 delete하는 함수입니다. 
    kref값이 0이 되면 자동으로 호출되어서 
@@ -192,6 +218,11 @@ static int usb_release(struct inode *inode, struct file *file) {
         return -ENODEV;
     }
 
+    if (dev->disconnected) {
+        // 여기서 안전하게 kfifo 해제
+        kfifo_free(&dev->rx_fifo);
+    }
+
     printk("[USB RELEASE][usb_release] : success to find usb_dev\n");
 
     // close를 할때 kref값을 1 줄임
@@ -201,81 +232,125 @@ static int usb_release(struct inode *inode, struct file *file) {
     return 0;
 }
 
-static int dequeue(struct urb *urb) 
-{
-    struct usb_info *dev = urb->context;
-
-    mutex_lock(&dev->buf_mutex);
-
-    // TODO : REad 구현
-    // if ((dev->tail) % BUFFER_SIZE)
-
-    return 0;
-}
-
 // ring buffer에 read callback 함수로부터 받은 데이터를 복사할 함수
 static int enqueue(struct urb *urb)
 {
     struct usb_info *dev = urb->context;
 
-    mutex_lock(&dev->buf_mutex);
+    printk("[ENQUEUE][enqueue] success to call enqueue!\n ");
+    unsigned char *data = urb->transfer_buffer;
 
-    // 링버퍼 full 체크
-    if ((dev->head + 1) % BUFFER_SIZE == dev->tail) {
-        pr_err("ring buffer full!\n");
-        mutex_unlock(&dev->buf_mutex);
-        return -ENOMEM;
-    }
+    int len = urb->actual_length;
+    int i = 0;
+    dev->rx_start = 0;
+    int retval;
+
+    // 장치로 부터 온 데이터를 바이트 별로 읽어서 처리를 함
+    while (i < len) {
+        switch (dev->rx_status) {
+            case PROTOCOL_STATE_IDLE:
+                if (data[i] == 0x02) { // STX 발견
+                    printk(KERN_DEBUG "[ENQUEUE][enqueue] STX found (0x02), moving to READ_LEN\n");
+                    dev->rx_status = PROTOCOL_STATE_READ_LEN;
+                    dev->rx_len = 0; // 카운트 초기화
+                    dev->rx_buffer[dev->rx_len++] = data[i];
+                }
+
+                break;
+
+            case PROTOCOL_STATE_READ_LEN:
+                dev->packet_len = data[i]; // 길이를 저장 
+                dev->rx_buffer[dev->rx_len++] = data[i];
+
+                // 길이 버퍼가 최소 길이보다 작을시(그러면 최소 보장 길이도 안됨)
+                if (dev->packet_len < MIN_PROTO_LEN || dev->packet_len > MAX_PROTO_LEN) {
+                    printk(KERN_ERR "[ENQUEUE][enqueue] Invalid Packet Length: %u (Min:%d, Max:%d), back to IDLE\n", 
+                           dev->packet_len, MIN_PROTO_LEN, MAX_PROTO_LEN);
+                    dev->rx_status = PROTOCOL_STATE_IDLE;
+                    dev->rx_len = 0;
+                } else {
+                    printk(KERN_DEBUG "[ENQUEUE][enqueue] Valid Length: %u, moving to READ_PAYLOAD\n", dev->packet_len);
+                    dev->rx_status = PROTOCOL_STATE_READ_PAYLOAD;
+                }
+
+                break;
+
+            case PROTOCOL_STATE_READ_PAYLOAD:
+                // 남은 데이터 양과 현재 들어온 데이터 양을 비교하여 복사
+                // 여기서는 단순화를 위해 한 바이트씩 처리
+                dev->rx_buffer[dev->rx_len++] = data[i];
+                
+                if (dev->rx_len >= dev->packet_len) {       // payload 길이는 (LEN패킷에서 STX(1) LEN(1) ID(1) CMD(1) ADDRESS(2) CRC(2) 값을 뺀 길이)
+                    printk(KERN_DEBUG "[ENQUEUE][enqueue] Payload collection complete (%u/%u), moving to VERIFY_CRC\n", 
+                           dev->rx_len, dev->packet_len);
+                    dev->rx_status = PROTOCOL_STATE_VERIFY_CRC;
+                }
+
+                break;
+
+            case PROTOCOL_STATE_VERIFY_CRC:
+                // CRC 검증 로직 (data[i]와 계산된 CRC 비교)
+                int crc_offset = dev->packet_len - 2;
+
+                // crc검증 로직까지 왔다면 기본적으로 올 데이터는 다 온셈
+                __u16 recv_crc = get_unaligned_be16(&dev->rx_buffer[crc_offset]);
+
+                __u16 address = get_unaligned_be16(dev->rx_buffer+4);    // 빅 엔디안으로 읽어옴
+                put_unaligned_le16(address,dev->rx_buffer+4);            // 주소값 리틀 엔디안 처리
+
+                __u64 payload = get_unaligned_be64(dev->rx_buffer+6);    // 빅 엔디안으로 읽어옴
+                put_unaligned_le64(payload, dev->rx_buffer+6);           // payload 빅 엔디안 처리
     
-    // 전달된 urb 데이터 복사
-    memcpy(dev->rx_buffer[dev->head], urb->transfer_buffer, urb->actual_length);
-    dev->rx_len += urb->actual_length;
 
-    __u8 *tmp_buf = dev->rx_buffer;
-    __u8 len = tmp_buf[1];
+                // 계산 CRC 범위: STX(0번) 제외, CRC(마지막 2바이트) 제외
+                // 즉, 인덱스 1(LEN)부터 데이터 끝까지 계산
+                __u16 calc_crc = crc16(0xFFFF, &dev->rx_buffer[1], dev->packet_len-3);
+                if (recv_crc != calc_crc) {
+                    printk(KERN_ERR "[ENQUEUE][enqueue] CRC Mismatch! Recv: %04X, Calc: %04X\n", recv_crc, calc_crc);
+                    break;
 
-    // 1. STX 체크
-    if (temp_buf[0] != 0x02) {
-        return -EINVAL;
+                } else {
+                    printk(KERN_INFO "[ENQUEUE][enqueue] CRC Check OK! Pushing %u bytes to kfifo\n", dev->packet_len);
+                    // 성공! 여기서는 데이터를 kfifo에 넣음
+                    unsigned int copied = kfifo_in(&dev->rx_fifo, dev->rx_buffer, dev->packet_len);
+                    
+                    if (copied < dev->packet_len)
+                        printk(KERN_WARNING "[ENQUEUE][enqueue] kfifo FULL! Data loss: %u bytes\n", dev->packet_len - copied);
+
+                    // 자고 있는 read 프로세스를 깨움
+                    wake_up_interruptible(&dev->bulk_in_wait);
+                }
+
+                // 패킷 하나 처리가 끝났으므로 다시 IDLE로 돌아가서 
+                // 현재 버퍼의 남은 데이터(i < len)에서 다음 STX를 찾음
+                dev->rx_status = PROTOCOL_STATE_IDLE;
+                dev->rx_len = 0;
+                break;
+        }
+        i++;
     }
+                // 다 끝났거나, 아님 len을 다 돌았는데도 처리가 끝나지 않을 경우
+                spin_lock_irq(&dev->err_lock);
+                dev->ongoing_read = 0;
+                spin_unlock_irq(&dev->err_lock);
 
-    // 수신 받은 길이가 len 필드 기준 적은지
-    if (dev->rx_len < len) {
-        return -ENOMEM;
-    }
+                // 미리 read urb를 보냄(빠른 수신을 위해서) or 다음에 또 다른 패킷을 보냄
+                retval = usb_do_read_io(dev,MAX_TRANSFER_PACKET);
+                if(retval < 0) {
+                    printk(KERN_ERR "[ENQUEUE][enqueue] Failed to resubmit read URB: %d\n", retval);
+                } else {
+                    printk(KERN_DEBUG "[ENQUEUE][enqueue] Read URB resubmitted successfully\n");
+                }
 
-    // CRC 체크
-
-    int crc_offset = len + 2;       // STX(1) + LEN(1) + (len 길이) -> CRC
-
-    // crc 수신
-    __u16 recv_crc = (kbuf[crc_offset + 1 ] << 8 ) | kbuf[crc_offset];
-
-    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : received CRC: 0x%04x\n", recv_crc);
-
-    // 계산 CRC
-    // CRC 범위 : payload + address + cmd + id (STX와 CRC 제외)
-    __u16 calc_crc = crc16(0xFFFF, &tmp_buf[2], len);
-
-    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : calculated CRC: 0x%04x\n", calc_crc);
-
-    if (recv_crc != calc_crc) {
-        return -EBADMSG;
-    }
-
-    // head 이동 buffer size로 나머지 연산을 해야함
-    dev->head = (dev->head + 1) % BUFFER_SIZE;
-
-    mutex_unlock(&dev->buf_mutex);
 
     return 0;
 }
-
 
 // 디바이스로부터 요청한 read_bulk_urb가 성공적으로 올때 호출됩니다.
 static void usb_read_callback(struct urb *urb) {
     struct usb_info *dev;
     unsigned long flags;
+    int status;
 
     // usb_fill_bulk_urb에서 context는 device입니다
     dev = urb->context;
@@ -283,8 +358,10 @@ static void usb_read_callback(struct urb *urb) {
 
     // 현재 CPU의 인터럽트를 끄고 인터럽트를 수행한다(인터럽트 핸들러 역활과 비슷함)
     spin_lock_irqsave(&dev->err_lock, flags);
+
+    status = urb->status;
     // "URB(USB Request Block)의 연결을 끊을 때 발생하는 상태값은 하드웨어 에러로 취급하지 않겠다
-    if (urb->status) {
+    if (status) {
         if (!(urb->status == -ENOENT ||
               urb->status == -ECONNRESET ||
               urb->status == -ESHUTDOWN))
@@ -302,20 +379,21 @@ static void usb_read_callback(struct urb *urb) {
     dev->ongoing_read = 0;
     spin_unlock_irqrestore(&dev->err_lock, flags);
 
-    int retval = enqueue(urb);
+    // 정상 수신일 경우에만 데이터 처리
+    if (status == 0) {
     
-    print_hex_dump(KERN_INFO, "rx: ",
-               DUMP_PREFIX_OFFSET,
-               16, 1,
-               urb->transfer_buffer,
-               urb->actual_length,
-               true);
-    
-    
+        print_hex_dump(KERN_INFO, "rx: ",
+                        DUMP_PREFIX_OFFSET,
+                        16, 1,
+                        urb->transfer_buffer,
+                        urb->actual_length,
+                        true);
+        
+        int retval = enqueue(urb);
 
-    // bulk-in 전송이 완료되었으므로, 블로킹(Blocking)된 읽기 작업을 실행 상태로 전환합니다.
-    wake_up_interruptible(&dev->bulk_in_wait);
+    }
 }
+
 
 static int usb_do_read_io(struct usb_info *dev, size_t count) {
     
@@ -329,6 +407,7 @@ static int usb_do_read_io(struct usb_info *dev, size_t count) {
                 min(dev->bulk_in_size, count),       // 버퍼 크기
                 usb_read_callback,           // 호출할 call back 함수
                 dev);
+
     printk("[USB_DO_READ_IO][usb_do_read_io] success to fill bulk urb\n");
 
     // urb 읽는 중 설정
@@ -342,7 +421,7 @@ static int usb_do_read_io(struct usb_info *dev, size_t count) {
     dev->bulk_in_copied = 0;
 
     // 장치에게 보냄 submit함
-    retval = usb_submit_urb(dev->bulk_in_urb, GFP_KERNEL);
+    retval = usb_submit_urb(dev->bulk_in_urb, GFP_ATOMIC);
     printk("[USB_DO_READ_IO][usb_do_read_io] success to submit urb\n");
 
     // 오류 시
@@ -365,13 +444,14 @@ static ssize_t usb_read(struct file *file, char *buffer, size_t count, loff_t *p
     struct usb_info *dev;
     int retval;
     bool ongoing_io;
+    unsigned int copied;
 
     // file(interface)에서 저장한 로컬 구조체(usb_info)를 불러옴
     dev = file->private_data;
 
-    // 읽을 길이가 0일시 종료
-    if (!count) {
-        return 0;
+    // 읽을 길이가 최소길이(헤더 길이)보다 작을 시
+    if (count < MIN_PROTO_LEN) {
+        return -EINVAL;
     }
 
     printk("[USB_READ][usb_read] : success to call read function!!\n");
@@ -379,7 +459,7 @@ static ssize_t usb_read(struct file *file, char *buffer, size_t count, loff_t *p
 
     // mutex lock과 같이 임계영역을 기다리되 event 즉 (Ctrl+c)같이 시그널이 오면 멈춤
     retval = mutex_lock_interruptible(&dev->io_mutex);
-    
+
     // 0은 mutex에서 열쇠 얻기 성공, 0 이하는 에러나 뭔가 오류가 생겼다는 의미입니다.
     if (retval < 0) {
         return retval;
@@ -392,112 +472,50 @@ static ssize_t usb_read(struct file *file, char *buffer, size_t count, loff_t *p
     }
 
 retry:
-    /* * 스핀락 : 아주 짧은 시간(나노초 단위) 동안 공유 데이터를 안전하게 확인합니다.
-    *  Busy-wait : 잠들지 않고 제자리에서 문이 열릴 때까지 기다립니다. (매우 빠름)
-    *  _irq : 값을 확인하는 찰나의 순간에도 하드웨어 방해(인터럽트)를 받지 않기 위해 사용합니다.
-    * !!주의!! : 이 안에서는 절대로 잠을 자거나(Sleep) 오래 걸리는 작업을 하면 안 됩니다!
-    */
-    spin_lock_irq(&dev->err_lock);
-    ongoing_io = dev->ongoing_read;
-    spin_unlock_irq(&dev->err_lock);
+    // 만약 kfifo가 비어있다면?
+    if (kfifo_is_empty(&dev->rx_fifo)) {
+        
+        // 아직 데이터를 가져오는 중(ongoing)이 아니라면, 장치에 요청을 보냄
+        if (!dev->ongoing_read) {
+            retval = usb_do_read_io(dev,count); // 여기서 URB 제출
+            if (retval < 0) 
+                goto exit;
+        }
 
-    printk("[USB_READ][usb_read] : ongoing id : %d\n",ongoing_io);
-
-    // 데이터가 오는 중인지 확인함
-    if (ongoing_io) {
-
-        // 유저가 "기다리기 싫다"고 설정(O_NONBLOCK)했다면
+        // 유저가 넌블로킹을 원하면 바로 복귀
         if (file->f_flags & O_NONBLOCK) {
-            retval = -EAGAIN;   // 오류 반환
+            retval = -EAGAIN;
             goto exit;
         }
 
-        //데이터가 다 올 때까지 프로세스를 재웁니다.
-        // dev->bulk_in_wait: 이 프로세스가 잠들 상태 변수 주소
-        // !dev->ongoing_read: 깨울 조건(여기서는 ongoing_read이 false가 될때 깨워짐)
-        printk("[USB_READ][usb_read] : wait event for read callback!!\n");
-        retval = wait_event_interruptible(dev->bulk_in_wait, (!dev->ongoing_read));
-        if (retval < 0) {
+        printk("[USB_READ][usb_read] : wait until read callback!!\n");
+        
+        // 데이터가 들어오거나 장치가 뽑힐 때까지 잠듦
+        // enqueue(콜백)에서 kfifo_in 후 wake_up을 해주면 여기서 깨어남
+        retval = wait_event_interruptible(dev->bulk_in_wait, 
+                                          (!kfifo_is_empty(&dev->rx_fifo) || dev->disconnected));
+        printk("[USB_READ][usb_read] : success to wake up!!\n");
+        
+        if (retval < 0) 
+            goto exit; // 시그널 중단
+            
+        if (dev->disconnected) {
+            retval = -ENODEV;
             goto exit;
         }
-        printk("[USB_READ][usb_read] : success to wake up by read callback!!\n");
+
+        // 5. 깨어났는데 혹시 모르니 다시 한번 비어있는지 체크하러 올라감 (retry)
+        goto retry;
     }
 
-    printk("[USB_READ][usb_read] : check for errors\n");
-    // 장치 에러에 관한 처리
-    retval = dev->errors;
-    if (retval < 0) {
-        // 에러가 한번이라도 발생했다면
-        dev->errors = 0;
-
-        // 상세한 USB 에러들 중, 복구가 필요한 '-EPIPE(Stall)'는 그대로 유지하고
-        // 나머지는 유저가 이해하기 쉬운 일반적인 입출력 에러('-EIO')로 변환합니다.
-        retval = (retval == -EPIPE) ? retval : -EIO;
-
-        // 에러 리포트
-        goto exit;
-    }
-    printk("[USB_READ][usb_read] : no errors\n");
-        /* 
-         * 읽기에 만족할 만큼 버퍼가 찼는지 확인하고
-         * 아니라면, 다시 기다립니다
-        */
-    printk("[USB_READ][usb_read] : check for bulk_in_filled... \n");
-       if(dev->bulk_in_filled) {
-            // 읽을 데이터가 있는지 확인
-
-            /* 
-            * (전체 받은 양 - 이미 유저가 읽어간 양) = 현재 줄 수 있는 남은 양
-            * (남은 재고)와 (유저가 요청한 크기) 중 더 작은 값을 최종 배달 양으로 결정
-            */
-            printk("[USB_READ][usb_read] : bulk_in_filled : %d\n",dev->bulk_in_filled);
-            size_t available = dev->bulk_in_filled - dev->bulk_in_copied;
-            size_t chunk = min(available, count);
-
-            // 유저에게 줄 데이터가 없으면 (데이터가 0)
-            if (!available) {
-
-                // 장치로 부터 데이터를 읽을 함수 호출(skel_do_read_io같은)
-                retval = usb_do_read_io(dev, count);
-                if (retval < 0) {
-                    goto exit;
-                } else {
-                    goto retry;
-                }
-            }
-            
-            // 데이터가 충분하면 (0이 아니면)
-            // chunk의 크기만큼 유저 공간에 copy됨
-            if (copy_to_user(buffer, 
-                            dev->bulk_in_buffer + dev->bulk_in_copied,
-                            chunk)) {
-                
-                // copy to user같은경우 실패시 6을 보냄
-                retval = -EFAULT;
-            } else {
-                printk("[USB_READ][usb_read] : success to copy to user");
-                retval = chunk;
-            }
-
-            dev->bulk_in_copied += chunk;
-            
-            // 아직 유저가 요청한 크기의 데이터가 도착이 안됐으면
-            if (available < count) 
-                usb_do_read_io(dev, count - chunk);
-        } else {
-                // 그게 아니라면 count만큼 다시한번 요청
-                usb_do_read_io(dev, count);
-                if (retval < 0) {
-                    goto exit;
-                } else {
-                    goto retry;
-                }
-        }
-
+    // 6. 데이터가 있으면 유저에게 전달 (더 이상 do_read_io나 copy_to_user 중복 불필요)
+    retval = kfifo_to_user(&dev->rx_fifo, buffer, count, &copied);
+    if (retval == 0)
+        retval = copied;
+    
     exit:
         mutex_unlock(&dev->io_mutex);
         return retval;
-
 }
 
 /*
@@ -529,14 +547,14 @@ static int check_protocol(__u8* kbuf, size_t actual_size)
 
     // header->len 파트 합리성 검증 : header->len이 min_frame보다 크고, max_frame보다 작은지
     if (len < MIN_PROTO_LEN || len > MAX_PROTO_LEN) {
-        printk(KERN_WARNING "[CHECK_PROTOCOL][check_protocol] : header length out of range: %u\n", header->len);
+        printk(KERN_WARNING "[CHECK_PROTOCOL][check_protocol] : header length out of range: %u\n", len);
         return -EMSGSIZE;
     }
 
-    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : header length OK: %u\n", header->len);
+    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : LEN field length OK: %u\n", len);
 
     // 전송 단위와의 관계 검증 : header->len과 actual_length(write size)를 비교
-    size_t expected = len + 4;      // header len + STX(1) + LEN(1) + CRC(2)
+    size_t expected = len;      // header len + STX(1) + LEN(1) + CRC(2)
     
     if (expected != actual_size) {
         printk(KERN_WARNING "[CHECK_PROTOCOL][check_protocol] : total length mismatch: expected=%zu, actual=%zu\n",
@@ -547,7 +565,7 @@ static int check_protocol(__u8* kbuf, size_t actual_size)
     printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : total length check passed: %zu bytes\n", actual_size);
 
     // crc 위치 계산
-    int crc_offset = len + 2;       // STX(1) + LEN(1) + (len 길이) -> CRC
+    int crc_offset = len-2;       // STX(1) + LEN(1) + (len 길이) -> CRC
 
     // crc 수신
 
@@ -558,7 +576,7 @@ static int check_protocol(__u8* kbuf, size_t actual_size)
 
     // 계산 CRC
     // CRC 범위 : payload + address + cmd + id (STX와 CRC 제외)
-    __u16 calc_crc = crc16(0xFFFF, &kbuf[2], (header->len));
+    __u16 calc_crc = crc16(0xFFFF, &kbuf[1], len-3);
 
     printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : calculated CRC: 0x%04x\n", calc_crc);
 
@@ -569,11 +587,11 @@ static int check_protocol(__u8* kbuf, size_t actual_size)
     // 검증이 다 끝났다면 16비트 이상의 값들을 빅 엔디안화 시킵니다.
     put_unaligned_be16(recv_crc,kbuf+crc_offset);               //빅 엔디안 처리CRC
     
-    __u16 address = get_unaligned_le16(kbuf+(crc_offset-4));    // 리틀 엔디안으로 읽어옴
-    put_unaligned_be16(address,kbuf+(crc_offset-4));            // 주소값 빅 엔디안 처리
+    __u16 address = get_unaligned_le16(kbuf+4);    // 리틀 엔디안으로 읽어옴
+    put_unaligned_be16(address,kbuf+4);            // 주소값 빅 엔디안 처리
 
-    __u16 payload = get_unaligned_le16(kbuf+(crc_offset-2));    // 리틀 엔디안으로 읽어옴
-    put_unaligned_be16(payload, kbuf+(crc_offset-2));           // payload 빅 엔디안 처리
+    __u64 payload = get_unaligned_le64(kbuf+6);    // 리틀 엔디안으로 읽어옴
+    put_unaligned_be64(payload, kbuf+6);           // payload 빅 엔디안 처리
     
     return 0;
 }
@@ -625,7 +643,7 @@ static ssize_t usb_write(struct file *file, const char *user_buffer, size_t coun
     int retval = 0;
     struct urb *urb = 0;
     char *buf = NULL;
-    size_t writesize = min_t(size_t, count, MAX_TRANSFER);
+    size_t writesize = min_t(size_t, count, MAX_TRANSFER_PACKET);
 
     dev = file->private_data;
 
@@ -839,10 +857,13 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
     
     // 구조체 내부 rx_buffer 관련 head, tail 구조체 초기화
     dev->head = 0;
-    dev->tail = 0;
     dev->rx_len = 0;
-
-
+    dev->rx_status = PROTOCOL_STATE_IDLE;
+    
+    // 커널용 fifo 버퍼 할당
+    if (kfifo_alloc(&dev->rx_fifo, 4096, GFP_KERNEL)) {
+        return -ENOMEM;
+    }
 
     /*usb 디바이스, 인터페이스 구조체 포인터 할당*/
     dev->udev = usb_get_dev(interface_to_usbdev(interface)); //usb_get_dev
