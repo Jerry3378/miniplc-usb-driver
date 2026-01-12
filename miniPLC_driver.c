@@ -109,9 +109,10 @@ struct usb_info {
     struct mutex buf_mutex;                 // 링 버퍼용 뮤택스
     unsigned int rx_len;                // enqueu 내에서 사용될 현재 누적된 버퍼
     protocol_state_t rx_status;             // rxbuffer의 상태를 나타낼 변수
-    unsigned int packet_len;            // read시 수신받은 패킷 길이
-    unsigned int rx_start;              
+    unsigned int packet_len;            // read시 수신받은 패킷 길이              
     struct kfifo rx_fifo;               // 데이터를 담을 링 버퍼
+    unsigned char temp_data[MAX_TRANSFER_PACKET];           // readcallback 시 데이터를 담을 변수 (bulk in urb는 sub do read io 호출 동안 사용할 임시 데이터)
+    unsigned int temp_len;
 };
 
 //해당 매크로 함수는 매개변수 d를 멤버로 가지는 구조체의 주소를 찾기 위한 매크로 함수입니다. 
@@ -233,17 +234,13 @@ static int usb_release(struct inode *inode, struct file *file) {
 }
 
 // ring buffer에 read callback 함수로부터 받은 데이터를 복사할 함수
-static int enqueue(struct urb *urb)
+static int enqueue(struct usb_info *dev)
 {
-    struct usb_info *dev = urb->context;
-
     printk("[ENQUEUE][enqueue] success to call enqueue!\n ");
-    unsigned char *data = urb->transfer_buffer;
+    unsigned char *data = dev->temp_data;
 
-    int len = urb->actual_length;
+    int len = dev->temp_len;
     int i = 0;
-    dev->rx_start = 0;
-    int retval;
 
     // 장치로 부터 온 데이터를 바이트 별로 읽어서 처리를 함
     while (i < len) {
@@ -316,9 +313,6 @@ static int enqueue(struct urb *urb)
                     
                     if (copied < dev->packet_len)
                         printk(KERN_WARNING "[ENQUEUE][enqueue] kfifo FULL! Data loss: %u bytes\n", dev->packet_len - copied);
-
-                    // 자고 있는 read 프로세스를 깨움
-                    wake_up_interruptible(&dev->bulk_in_wait);
                 }
 
                 // 패킷 하나 처리가 끝났으므로 다시 IDLE로 돌아가서 
@@ -329,20 +323,6 @@ static int enqueue(struct urb *urb)
         }
         i++;
     }
-                // 다 끝났거나, 아님 len을 다 돌았는데도 처리가 끝나지 않을 경우
-                spin_lock_irq(&dev->err_lock);
-                dev->ongoing_read = 0;
-                spin_unlock_irq(&dev->err_lock);
-
-                // 미리 read urb를 보냄(빠른 수신을 위해서) or 다음에 또 다른 패킷을 보냄
-                retval = usb_do_read_io(dev,MAX_TRANSFER_PACKET);
-                if(retval < 0) {
-                    printk(KERN_ERR "[ENQUEUE][enqueue] Failed to resubmit read URB: %d\n", retval);
-                } else {
-                    printk(KERN_DEBUG "[ENQUEUE][enqueue] Read URB resubmitted successfully\n");
-                }
-
-
     return 0;
 }
 
@@ -377,6 +357,10 @@ static void usb_read_callback(struct urb *urb) {
 
     // 읽기 종료
     dev->ongoing_read = 0;
+
+    // temp 배열에 transffer버퍼만큼 실제 urb길이를 복사
+    memcpy(dev->temp_data, urb->transfer_buffer, urb->actual_length);
+    dev->temp_len = urb->actual_length;
     spin_unlock_irqrestore(&dev->err_lock, flags);
 
     // 정상 수신일 경우에만 데이터 처리
@@ -388,10 +372,9 @@ static void usb_read_callback(struct urb *urb) {
                         urb->transfer_buffer,
                         urb->actual_length,
                         true);
-        
-        int retval = enqueue(urb);
-
     }
+
+    wake_up_interruptible(&dev->bulk_in_wait);
 }
 
 
@@ -421,7 +404,7 @@ static int usb_do_read_io(struct usb_info *dev, size_t count) {
     dev->bulk_in_copied = 0;
 
     // 장치에게 보냄 submit함
-    retval = usb_submit_urb(dev->bulk_in_urb, GFP_ATOMIC);
+    retval = usb_submit_urb(dev->bulk_in_urb, GFP_KERNEL);
     printk("[USB_DO_READ_IO][usb_do_read_io] success to submit urb\n");
 
     // 오류 시
@@ -491,10 +474,23 @@ retry:
         printk("[USB_READ][usb_read] : wait until read callback!!\n");
         
         // 데이터가 들어오거나 장치가 뽑힐 때까지 잠듦
-        // enqueue(콜백)에서 kfifo_in 후 wake_up을 해주면 여기서 깨어남
-        retval = wait_event_interruptible(dev->bulk_in_wait, 
-                                          (!kfifo_is_empty(&dev->rx_fifo) || dev->disconnected));
+        // read callback 함수에서 wake_up을 해주면 여기서 깨어남
+        retval = wait_event_interruptible(dev->bulk_in_wait, (!dev->ongoing_read));
         printk("[USB_READ][usb_read] : success to wake up!!\n");
+
+        // wake up후 enqueue즉 데이터를 검증하고 큐에 넣음
+        retval = enqueue(dev);
+
+        if (dev->rx_status != PROTOCOL_STATE_IDLE) {
+            // 미리 read urb를 보냄(빠른 수신을 위해서) or 다음에 또 다른 패킷을 보냄
+            retval = usb_do_read_io(dev,MAX_TRANSFER_PACKET);
+            
+            if(retval < 0) {
+                printk(KERN_ERR "[ENQUEUE][enqueue] Failed to resubmit read URB: %d\n", retval);
+            } else {
+                printk(KERN_DEBUG "[ENQUEUE][enqueue] Read URB resubmitted successfully\n");
+            }
+        }
         
         if (retval < 0) 
             goto exit; // 시그널 중단
@@ -855,10 +851,9 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
     init_usb_anchor(&dev->submitted);
     dev_info(&interface->dev, "[USB PROBE][usb_probe] : success to initalize anchor!!\n");    
     
-    // 구조체 내부 rx_buffer 관련 head, tail 구조체 초기화
-    dev->head = 0;
-    dev->rx_len = 0;
+    // 구조체 내부 status 를 idle상태로 변환
     dev->rx_status = PROTOCOL_STATE_IDLE;
+
     
     // 커널용 fifo 버퍼 할당
     if (kfifo_alloc(&dev->rx_fifo, 4096, GFP_KERNEL)) {
