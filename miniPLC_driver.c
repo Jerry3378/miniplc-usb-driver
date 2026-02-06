@@ -40,6 +40,14 @@
 #define MAX_PROTO_LEN  251     // 최대 LEN 값은 255 - STX(1) - CRC(2) - 1 (LEN 필드)
 #define PROTO_HEAD_LEN  6
 
+
+typedef enum {
+	DATA_TYPE_8 = 0,	// 8bit
+	DATA_TYPE_16,	// 16bit
+	DATA_TYPE_32,	// 32bit
+	DATA_TYPE_64		// 64bit
+} command_type_t;
+
 // read에서 read에 대한 상태 체크를 위한 enum입니다
 typedef enum {
     /* 0: 아직 데이터를 받지 않았거나 에러 후 초기화된 상태 */
@@ -226,10 +234,43 @@ static int usb_release(struct inode *inode, struct file *file) {
 
     printk("[USB RELEASE][usb_release] : success to find usb_dev\n");
 
+    // 상태 완전 초기화
+    spin_lock(&dev->err_lock);
+    dev->errors = 0;
+    dev->ongoing_read = 0;
+    spin_unlock(&dev->err_lock);
+
     // close를 할때 kref값을 1 줄임
     kref_put(&dev->kref, usb_delete);
 
     printk("[USB RELEASE][usb_release] : success close file, kref changes %d -> %d\n", kref_read(&dev->kref)+1, kref_read(&dev->kref));
+    return 0;
+}
+
+// 데이타 타입별로 데이타를 적는 함수입니다.
+static size_t read_data_by_type(uint8_t *addr, uint8_t data_type) {
+    switch (data_type) {
+    case DATA_TYPE_8:
+            *(uint8_t *)addr = *addr;
+            return 1;
+    case DATA_TYPE_16:
+    {       __u16 data = get_unaligned_be16(addr);
+            printk(KERN_INFO "[enqueue][enqueue] : try to change data, LE: %02x\n", data);
+            put_unaligned_le16(data, addr);
+            return 2;
+    }
+    case DATA_TYPE_32:
+        {   __u32 data = get_unaligned_be32(addr);
+            put_unaligned_le32(data, addr);
+            return 4;
+        }
+    case DATA_TYPE_64:
+        {   __u64 data = get_unaligned_be64(addr);
+            put_unaligned_le64(data, addr);
+            return 8;
+        }
+    }
+
     return 0;
 }
 
@@ -281,45 +322,65 @@ static int enqueue(struct usb_info *dev)
                     printk(KERN_DEBUG "[ENQUEUE][enqueue] Payload collection complete (%u/%u), moving to VERIFY_CRC\n", 
                            dev->rx_len, dev->packet_len);
                     dev->rx_status = PROTOCOL_STATE_VERIFY_CRC;
+
+                    // 의도적으로 goto문
+                    goto go_to_crc;
                 }
 
+                // 여기서 검증후 len까지 읽으니깐 crc가 빼먹은거임;
                 break;
 
             case PROTOCOL_STATE_VERIFY_CRC:
+go_to_crc:
+
                 // CRC 검증 로직 (data[i]와 계산된 CRC 비교)
                 int crc_offset = dev->packet_len - 2;
 
                 // crc검증 로직까지 왔다면 기본적으로 올 데이터는 다 온셈
                 __u16 recv_crc = get_unaligned_be16(&dev->rx_buffer[crc_offset]);
 
-                __u16 address = get_unaligned_be16(dev->rx_buffer+4);    // 빅 엔디안으로 읽어옴
-                put_unaligned_le16(address,dev->rx_buffer+4);            // 주소값 리틀 엔디안 처리
-
-                __u64 payload = get_unaligned_be64(dev->rx_buffer+6);    // 빅 엔디안으로 읽어옴
-                put_unaligned_le64(payload, dev->rx_buffer+6);           // payload 빅 엔디안 처리
-    
-
                 // 계산 CRC 범위: STX(0번) 제외, CRC(마지막 2바이트) 제외
                 // 즉, 인덱스 1(LEN)부터 데이터 끝까지 계산
-                __u16 calc_crc = crc16(0xFFFF, &dev->rx_buffer[1], dev->packet_len-3);
+                __u16 calc_crc = crc16(0xFFFF, &dev->rx_buffer[0], dev->packet_len-2);
+
+                printk(KERN_INFO "[ENQUEUE][enqueue] CRC Check...  recv_crc : %04x Calc : %04x\n", recv_crc, calc_crc);
+
                 if (recv_crc != calc_crc) {
                     printk(KERN_ERR "[ENQUEUE][enqueue] CRC Mismatch! Recv: %04X, Calc: %04X\n", recv_crc, calc_crc);
                     break;
 
                 } else {
                     printk(KERN_INFO "[ENQUEUE][enqueue] CRC Check OK! Pushing %u bytes to kfifo\n", dev->packet_len);
+                    // 검증이 다 끝났다면 16비트 이상의 값들을 빅 엔디안화 시킵니다.
+                    
+                    // count갯수 만큼 가변적으로 데이터가 있음
+                    __u8 cmd = dev->rx_buffer[3];
+
+                    // ack_read일 경우 
+                    if (cmd == 5) {
+                        printk(KERN_INFO "[ENQUEUE][enqueue] : change be payload to little-endian\n");
+                        __u8 data_type = dev->rx_buffer[5];     
+                        __u8 count = dev->rx_buffer[6];
+                        __u16 offset = 7;
+                        
+                        for (int i = 0; i < count; i++) {
+                                // write일 경우에 address 다음에 data필드가 있어서 그 부분도 지나가야함
+                                offset += read_data_by_type(dev->rx_buffer+offset,data_type);
+                            }
+                    }   
+
                     // 성공! 여기서는 데이터를 kfifo에 넣음
                     unsigned int copied = kfifo_in(&dev->rx_fifo, dev->rx_buffer, dev->packet_len);
                     
                     if (copied < dev->packet_len)
                         printk(KERN_WARNING "[ENQUEUE][enqueue] kfifo FULL! Data loss: %u bytes\n", dev->packet_len - copied);
+                    
+                    // 패킷 하나 처리가 끝났으므로 다시 IDLE로 돌아가서 
+                    // 현재 버퍼의 남은 데이터(i < len)에서 다음 STX를 찾음
+                    dev->rx_status = PROTOCOL_STATE_IDLE;
+                    dev->rx_len = 0;
+                    break;
                 }
-
-                // 패킷 하나 처리가 끝났으므로 다시 IDLE로 돌아가서 
-                // 현재 버퍼의 남은 데이터(i < len)에서 다음 STX를 찾음
-                dev->rx_status = PROTOCOL_STATE_IDLE;
-                dev->rx_len = 0;
-                break;
         }
         i++;
     }
@@ -475,11 +536,26 @@ retry:
         
         // 데이터가 들어오거나 장치가 뽑힐 때까지 잠듦
         // read callback 함수에서 wake_up을 해주면 여기서 깨어남
-        retval = wait_event_interruptible(dev->bulk_in_wait, (!dev->ongoing_read));
+        // [추가] : 일정시간 데이터가 안들어오면 타임아웃
+        retval = wait_event_interruptible_timeout(dev->bulk_in_wait, (!dev->ongoing_read), 
+                            msecs_to_jiffies(1000));   // 1초 정도 시간
+        // signal로 깨어남 (이 부분이 없을 시 read블록 된 상태에서 ctrl-c를 누를 시 계속 read호출함)
+        if (retval > 0) {
+            // 정상적으로 조건 만족
+            // wake up후 enqueue즉 데이터를 검증하고 큐에 넣음
+            retval = enqueue(dev);
+        } else if (retval == 0) {
+            // 타임아웃
+            retval = -ETIMEDOUT;
+            goto exit;
+        } else {
+            // 시그널에 의해 중단됨
+            printk(KERN_INFO "[USB_READ] interrupted by signal\n");
+            retval = -ERESTARTSYS;
+            goto exit;
+        }
+        
         printk("[USB_READ][usb_read] : success to wake up!!\n");
-
-        // wake up후 enqueue즉 데이터를 검증하고 큐에 넣음
-        retval = enqueue(dev);
 
         if (dev->rx_status != PROTOCOL_STATE_IDLE) {
             // 미리 read urb를 보냄(빠른 수신을 위해서) or 다음에 또 다른 패킷을 보냄
@@ -512,6 +588,35 @@ retry:
     exit:
         mutex_unlock(&dev->io_mutex);
         return retval;
+}
+
+// 데이타 타입별로 데이타를 적는 함수입니다.
+static size_t write_data_by_type(uint8_t *addr, uint8_t data_type) {
+    switch (data_type) {
+    case DATA_TYPE_8:
+            *(uint8_t *)addr = *addr;
+            return 1;
+    case DATA_TYPE_16:
+    {       __u16 data = get_unaligned_le16(addr);
+            printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : try to change data, LE: %02x\n", data);
+            put_unaligned_be16(data, addr);
+            return 2;
+    }
+    case DATA_TYPE_32:
+        {
+            __u32 data = get_unaligned_le32(addr);
+            put_unaligned_be32(data, addr);
+            return 4;
+        }
+    case DATA_TYPE_64:
+        {
+            __u64 data = get_unaligned_le64(addr);
+            put_unaligned_be64(data, addr);
+            return 8;
+        }
+    }
+
+    return 0;
 }
 
 /*
@@ -571,8 +676,8 @@ static int check_protocol(__u8* kbuf, size_t actual_size)
     printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : received CRC: 0x%04x\n", recv_crc);
 
     // 계산 CRC
-    // CRC 범위 : payload + address + cmd + id (STX와 CRC 제외)
-    __u16 calc_crc = crc16(0xFFFF, &kbuf[1], len-3);
+    // CRC 범위 : stx ~ crc전까지 (STX와 CRC 제외)
+    __u16 calc_crc = crc16(0xFFFF, &kbuf[0], len-2);
 
     printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : calculated CRC: 0x%04x\n", calc_crc);
 
@@ -580,15 +685,32 @@ static int check_protocol(__u8* kbuf, size_t actual_size)
         return -EBADMSG;
     }
 
-    // 검증이 다 끝났다면 16비트 이상의 값들을 빅 엔디안화 시킵니다.
-    put_unaligned_be16(recv_crc,kbuf+crc_offset);               //빅 엔디안 처리CRC
-    
-    __u16 address = get_unaligned_le16(kbuf+4);    // 리틀 엔디안으로 읽어옴
-    put_unaligned_be16(address,kbuf+4);            // 주소값 빅 엔디안 처리
+    __u8 cmd = kbuf[3];     //cmd 저장
+    __u8 data_type = kbuf[5];     // write일 경우 데이터 크기
+    __u8 count = kbuf[6];
+    __u16 offset = 7;
+    __u16 addr = 0;
 
-    __u64 payload = get_unaligned_le64(kbuf+6);    // 리틀 엔디안으로 읽어옴
-    put_unaligned_be64(payload, kbuf+6);           // payload 빅 엔디안 처리
+    // 검증이 다 끝났다면 16비트 이상의 값들을 빅 엔디안화 시킵니다.
     
+    printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : change le payload to bigend\n");
+    // count갯수 만큼 가변적으로 데이터가 있음
+	for (int i = 0; i < count; i++) {
+        // 1. address 추출 및 빅엔디안
+        __u16 address = get_unaligned_le16(kbuf+offset);    // 리틀 엔디안으로 읽어옴
+        printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : try to change address, LE: %02x\n", address);
+        put_unaligned_be16(address, kbuf+offset);            // 주소값 빅 엔디안 처리
+        printk(KERN_INFO "[CHECK_PROTOCOL][check_protocol] : success to change address in big-endian %02x\n", *(kbuf+offset));
+        offset += 2;
+
+        if (cmd == 1) {
+			// write일 경우에 address 다음에 data필드가 있어서 그 부분도 지나가야함
+            offset += write_data_by_type(kbuf+offset,data_type);
+        }
+    }
+
+    put_unaligned_be16(recv_crc,kbuf+(len-2));               //빅 엔디안 처리CRC
+
     return 0;
 }
 
@@ -713,7 +835,6 @@ static ssize_t usb_write(struct file *file, const char *user_buffer, size_t coun
         retval = -EFAULT;  /* "잘못된 메모리 주소입니다"라는 에러 코드를 설정 */
         goto error;        /* 할당받은 메모리를 해제하는 에러 처리 구간으로 이동 */
     }
-
 
     // check if protocol structure is fit for deliver
     if (retval = check_protocol((__u8*)buf, writesize) < 0)
