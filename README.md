@@ -1,7 +1,7 @@
 # miniplc-usb-driver
 
 ## Background
-This project originated from a real-world debugging experience where an intermittent data corruption bug in an industrial PLC driver was traced to a driver-level address arithmetic error. The APNX protocol was designed to address reliability gaps observed during that analysis — incorporating Fail-Fast address validation and explicit error codes in NAK responses.
+This project was developed as a personal study of industrial communication protocols, inspired by hands-on experience analyzing LS XGT CNET protocol and its driver implementation. The APNX protocol was independently designed to explore reliability considerations such as Fail-Fast address validation and explicit error codes in NAK responses.
 
 ## Protocol: APNX
 
