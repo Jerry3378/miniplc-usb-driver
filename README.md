@@ -58,10 +58,14 @@ Device-side conversion to Little Endian is handled internally.
 
 
 ## Architecture
+The driver implements a layered design separating protocol parsing 
+from USB transport.
+
 - Protocol frame: STX / LEN / ID / CMD / ADDR / DATA / CRC16
 - FSM-based packet parsing (IDLE → READ_LEN → READ_PAYLOAD → VERIFY_CRC)
 - Kernel-side: URB, DMA (usb_alloc_coherent), kfifo ring buffer
-- Synchronization: spinlock (IRQ context), mutex (process context), semaphore (write throttle)
+- Synchronization: spinlock (IRQ context), mutex (process context), 
+  semaphore (write throttle)
 
 ## Driver Lifecycle
 probe → open → read/write → release → disconnect
@@ -70,8 +74,10 @@ Each stage manages USB endpoint setup, URB submission,
 kfifo-based buffering, and safe resource cleanup on disconnect.
 
 ## Build
+```bash
 make
 sudo insmod miniPLC_driver.ko
+```
 
 ## Environment
 - Linux kernel 6.12.75
